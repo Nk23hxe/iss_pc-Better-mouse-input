@@ -10,3 +10,4 @@ Este diretório tem o código que roda o `eboot.bin` original do TLG (PS4, CUSA0
 Documentação, status e instruções de uso estão no [README principal](../README.md).
 A origem do código (gow3_pc → bloodborne_pc, shadPS4) e a licença (GPL-2.0-or-later) estão em
 [UPSTREAM.md](UPSTREAM.md) e [LICENSE](LICENSE).
+ 
