@@ -4,11 +4,10 @@
 #include <math.h>
 #include <stdint.h>
 
-/* High ceiling to prevent clamping on fast swipes (was 2400.0f) */
-#define MOUSE_STICK_FULL_SPEED 6000.0f
-/* Tight 4ms window: eliminates the 1-frame (16ms) lag while smoothing out micro-jitter */
-#define MOUSE_STICK_WINDOW_S 0.004f
-#define MOUSE_STICK_REST 0.005f
+/* High ceiling to prevent clamping on fast hand flicks (was 2400.0f) */
+#define MOUSE_STICK_FULL_SPEED 10000.0f
+#define MOUSE_STICK_WINDOW_S 0.002f
+#define MOUSE_STICK_REST 0.001f
 
 typedef struct {
     float sensitivity; /* 0.05 .. 10 */
@@ -19,19 +18,19 @@ typedef struct {
 } MouseStickParams;
 
 typedef struct {
-    float acc[2], acc_t; /* counts and seconds of the current window */
+    float acc[2], acc_t;
     float target[2];
-    float out[2];        /* filtered deflection, -1 .. 1, before the anti-dead zone */
+    float out[2];
 } MouseStick;
 
 static inline float mouse_stick_clamp(float v, float lo, float hi) { return v<lo ? lo : v>hi ? hi : v; }
 
-/* dx, dy: mouse counts since the last call; dt: seconds since it. */
+/* Immediate 1:1 translation with minimum accumulation latency */
 static inline void mouse_stick_update(MouseStick *s, const MouseStickParams *p, float dx, float dy, float dt) {
     if (dt > 0.1f) { dx *= 0.1f / dt; dy *= 0.1f / dt; }
     dt = mouse_stick_clamp(dt, 0.0005f, 0.1f);
 
-    s->acc[0] += dx; 
+    s->acc[0] += dx;
     s->acc[1] += p->invert_y ? -dy : dy;
     s->acc_t += dt;
 
@@ -52,7 +51,7 @@ static inline void mouse_stick_update(MouseStick *s, const MouseStickParams *p, 
 
     const float smooth = mouse_stick_clamp(p->smoothing, 0.0f, 0.95f);
     if (smooth <= 0.001f) {
-        /* When smoothing is 0, track the target instantaneously with zero inertia */
+        /* Zero inertia / immediate 1:1 hand tracking */
         s->out[0] = s->target[0];
         s->out[1] = s->target[1];
     } else {
@@ -69,11 +68,15 @@ static inline void mouse_stick_update(MouseStick *s, const MouseStickParams *p, 
     }
 }
 
-/* The deflection of one axis after the anti-dead zone, -1 .. 1 (0 at rest). */
+/* Aggressive anti-deadzone to immediately bypass the engine's inner stick deadzone */
 static inline float mouse_stick_axis(const MouseStick *s, const MouseStickParams *p, int axis) {
     const float v = s->out[axis], a = fabsf(v);
     if (a < MOUSE_STICK_REST) return 0.0f;
-    const float dz = mouse_stick_clamp(p->deadzone, 0.0f, 0.5f);
+
+    /* Base anti-deadzone floor (0.18f) pierces the PS4 internal deadzone wall on micro-movements */
+    float dz = p->deadzone > 0.0f ? p->deadzone : 0.18f;
+    dz = mouse_stick_clamp(dz, 0.15f, 0.5f);
+
     const float lifted = mouse_stick_clamp(dz + (1.0f - dz) * a, 0.0f, 1.0f);
     return v < 0 ? -lifted : lifted;
 }
