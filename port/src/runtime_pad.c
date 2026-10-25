@@ -2,10 +2,10 @@
  * by the window thread (gpu/shim/window.cpp); here state is only sampled.
  *
  * Default keyboard layout (TLG_KEY_MAP changes the buttons, see apply_button_map):
- *   WASD left stick, arrow keys right stick, Space Cross, LShift Circle,
+ *   WASD left stick, Space Cross, LShift Circle,
  *   E Square, Q Triangle, 1 L1, 3 R1, R L2, F R2, Z L3, C R3,
  *   Enter Options, Tab left touchpad (photo mode), Backspace right touchpad (pause menu),
- *   IJKL d-pad (I up, K down, J left, L right).
+ *   Arrow keys d-pad (Up, Down, Left, Right).
  * Mouse (while the window has it, see tlggpu_mouse_take; Esc releases it, a click takes it back):
  *   motion turns the camera (right stick, src/mouse_stick.h), left button R2 (use the power),
  *   right button L2 (aim), middle button R3. X1/X2 and the wheel are free for TLG_KEY_MAP
@@ -22,7 +22,6 @@
 #include <SDL3/SDL.h>
 #include "mouse_stick.h"
 #include "mouse_touch.h"
-#include "iss_mouse_aim.h"
 #include <sys/stat.h>
 
 #define ERR_INVALID_ARG ((int32_t)0x80920001)
@@ -36,6 +35,9 @@ enum {
     BTN_L2=0x100, BTN_R2=0x200, BTN_L1=0x400, BTN_R1=0x800, BTN_TRIANGLE=0x1000, BTN_CIRCLE=0x2000,
     BTN_CROSS=0x4000, BTN_SQUARE=0x8000, BTN_TOUCHPAD=0x100000,
     CLICK_LEFT=0x40000000, CLICK_RIGHT=0x80000000,
+    /* Virtual axis mappings for TLG_KEY_MAP */
+    KEY_STICK_RX_NEG=0x01000000, KEY_STICK_RX_POS=0x02000000,
+    KEY_STICK_RY_NEG=0x04000000, KEY_STICK_RY_POS=0x08000000
 };
 typedef struct { uint16_t x, y; uint8_t id, reserve[3]; } PadTouch;
 typedef struct {
@@ -184,6 +186,8 @@ static const struct { const char *name; uint32_t ps; } ps_names[]={
     {"l1",BTN_L1}, {"r1",BTN_R1}, {"l2",BTN_L2}, {"r2",BTN_R2}, {"l3",BTN_L3}, {"r3",BTN_R3},
     {"options",BTN_OPTIONS}, {"touchpad",CLICK_LEFT}, {"touchpad_left",CLICK_LEFT}, {"touchpad_right",CLICK_RIGHT},
     {"up",BTN_UP}, {"down",BTN_DOWN}, {"left",BTN_LEFT}, {"right",BTN_RIGHT},
+    {"rx_neg",KEY_STICK_RX_NEG}, {"rx_pos",KEY_STICK_RX_POS},
+    {"ry_neg",KEY_STICK_RY_NEG}, {"ry_pos",KEY_STICK_RY_POS},
 };
 
 enum { MOUSE_SOURCE=0x10000, MOUSE_LEFT=MOUSE_SOURCE, MOUSE_MIDDLE, MOUSE_RIGHT, MOUSE_X1, MOUSE_X2,
@@ -210,7 +214,7 @@ static ButtonMap key_map={{
     {SDL_SCANCODE_Q,BTN_TRIANGLE}, {SDL_SCANCODE_1,BTN_L1}, {SDL_SCANCODE_3,BTN_R1},
     {SDL_SCANCODE_R,BTN_L2}, {SDL_SCANCODE_F,BTN_R2}, {SDL_SCANCODE_Z,BTN_L3}, {SDL_SCANCODE_C,BTN_R3},
     {SDL_SCANCODE_RETURN,BTN_OPTIONS}, {SDL_SCANCODE_TAB,CLICK_LEFT}, {SDL_SCANCODE_BACKSPACE,CLICK_RIGHT},
-    {SDL_SCANCODE_I,BTN_UP}, {SDL_SCANCODE_K,BTN_DOWN}, {SDL_SCANCODE_J,BTN_LEFT}, {SDL_SCANCODE_L,BTN_RIGHT},
+    {SDL_SCANCODE_UP,BTN_UP}, {SDL_SCANCODE_DOWN,BTN_DOWN}, {SDL_SCANCODE_LEFT,BTN_LEFT}, {SDL_SCANCODE_RIGHT,BTN_RIGHT},
     {MOUSE_LEFT,BTN_R2}, {MOUSE_RIGHT,BTN_L2}, {MOUSE_MIDDLE,BTN_R3},
 },20};
 
@@ -267,12 +271,13 @@ static int apply_button_map(ButtonMap *map, const char *spec, bool keyboard) {
             printf("Runtime: pad map: ignored '%s=%s'\n",button,names);
             continue;
         }
-        /* Preserve mouse buttons when clearing or remapping keyboard actions */
+
+        /* Keyboard mapping only modifies keyboard scancodes; mouse buttons remain permanent */
         size_t kept=0;
         for (size_t i=0;i<map->count;++i) {
             if (map->entries[i].ps!=ps) {
                 map->entries[kept++]=map->entries[i];
-            } else if (keyboard && map->entries[i].source>=MOUSE_SOURCE && !has_mouse_source && none) {
+            } else if (keyboard && map->entries[i].source>=MOUSE_SOURCE && !has_mouse_source) {
                 map->entries[kept++]=map->entries[i];
             }
         }
@@ -513,13 +518,20 @@ static uint32_t sample_mouse(PadData *d, bool aiming_can, const bool *k) {
         mouse_pad.active=mouse_pad.two_fingers=false;
         mouse_touch_lift(&mouse_pad.finger);
         tlggpu_mouse_pad_hud(0,0,0,0,0);
-        runtime_mouse_aim_motion(0.0f,0.0f,in.sensitivity,in.invert_y,0);
         return 0;
     }
     load_pad_mode();
     if (!was_captured) { m.dx=m.dy=0; was_captured=true; }
     ++mouse_samples;
-    const MouseStickParams p={in.sensitivity,in.smoothing,in.accel,in.deadzone,in.invert_y};
+
+    /* Instantaneous 1:1 camera curve: zero deadzone, zero smoothing delay */
+    const MouseStickParams p = {
+        .sensitivity = in.sensitivity * 2.2f,
+        .smoothing = 0.0f,
+        .accel = 0.0f,
+        .deadzone = 0.0f,
+        .invert_y = in.invert_y
+    };
     const uint32_t raw=m.held|m.pressed;
 
     bool key_down=false;
@@ -565,9 +577,8 @@ static uint32_t sample_mouse(PadData *d, bool aiming_can, const bool *k) {
         tlggpu_mouse_pad_hud(0,0,0,0,0);
     }
 
-    int direct_aim_handled = 0;
     if (pad_mode) {
-        runtime_mouse_aim_motion(0.0f,0.0f,in.sensitivity,in.invert_y,0);
+        /* finger handles touchpad */
     } else if (aiming_can) {
         const float kc=0.0006f*in.sensitivity*tlggpu_sensor_aim_scale();
         motion.yaw-=m.dx*kc;
@@ -575,27 +586,18 @@ static uint32_t sample_mouse(PadData *d, bool aiming_can, const bool *k) {
         motion.yaw=fminf(fmaxf(motion.yaw,-1.4f),1.4f);
         motion.aim_pitch=fminf(fmaxf(motion.aim_pitch,-1.2f),1.2f);
         memset(&mouse_stick,0,sizeof(mouse_stick));
-        runtime_mouse_aim_motion(0.0f,0.0f,in.sensitivity,in.invert_y,0);
     } else {
-        /* Direct camera angle injection hook (Axylpup 1:1 camera aim) */
-        direct_aim_handled = runtime_mouse_aim_motion(m.dx, m.dy, in.sensitivity, in.invert_y, m.captured);
-        if (direct_aim_handled) {
-            memset(&mouse_stick,0,sizeof(mouse_stick));
-        } else {
-            /* Fallback to stick emulation if hook not applicable */
-            mouse_stick_update(&mouse_stick,&p,m.dx,m.dy,dt);
-        }
+        mouse_stick_update(&mouse_stick,&p,m.dx,m.dy,dt);
     }
 
     const uint8_t base_x=d->right_x, base_y=d->right_y;
-    if (!direct_aim_handled) {
-        const float def_x=mouse_stick_axis(&mouse_stick,&p,0);
-        const float def_y=mouse_stick_axis(&mouse_stick,&p,1);
-        if (def_x!=0.0f || def_y!=0.0f) {
-            d->right_x=mouse_stick_add(128,def_x);
-            d->right_y=mouse_stick_add(128,def_y);
-        }
+    const float def_x=mouse_stick_axis(&mouse_stick,&p,0);
+    const float def_y=mouse_stick_axis(&mouse_stick,&p,1);
+    if (def_x!=0.0f || def_y!=0.0f) {
+        d->right_x=mouse_stick_add(128,def_x);
+        d->right_y=mouse_stick_add(128,def_y);
     }
+
     uint32_t bits=raw;
     if (pad_mode) bits&=~(uint32_t)MOUSE_BUTTONS_MASK;
     const int32_t notches[4]={m.wheel_up,m.wheel_down,m.wheel_left,m.wheel_right};
@@ -613,10 +615,10 @@ static uint32_t sample_mouse(PadData *d, bool aiming_can, const bool *k) {
     if (log_state<0) { const char *a=getenv("TLG_MOUSE_LOG"), *b=getenv("TLG_MOUSE_TEST"); log_state=(a && *a=='1') || (b && *b=='1'); }
     if (log_state) {
         static bool was_active;
-        const bool active=bits || d->right_x!=base_x || d->right_y!=base_y || pad_mode || direct_aim_handled;
+        const bool active=bits || d->right_x!=base_x || d->right_y!=base_y || pad_mode;
         if ((active && now-last_log>=250000) || (was_active && !active)) {
-            printf("Runtime: mouse dx=%.1f dy=%.1f direct_aim=%d -> right stick %u,%u, mouse buttons 0x%x%s\n",m.dx,m.dy,
-                   direct_aim_handled,d->right_x,d->right_y,bits,pad_mode ? " (touchpad mode)" : "");
+            printf("Runtime: mouse dx=%.1f dy=%.1f -> right stick %u,%u, mouse buttons 0x%x%s\n",m.dx,m.dy,
+                   d->right_x,d->right_y,bits,pad_mode ? " (touchpad mode)" : "");
             if (pad_mode)
                 printf("Runtime: mouse finger at %.0f,%.0f touch=%d click=%d two=%d\n",mouse_pad.out.x,mouse_pad.out.y,
                        mouse_pad.out.touch,mouse_pad.out.click,mouse_pad.two_fingers);
@@ -673,21 +675,41 @@ static void sample_host(PadData *d) {
         }
     }
     sample_motion(d,g,k);
-    if (!k) return;
-    const uint32_t mouse=sample_mouse(d,motion.mode || k[SDL_SCANCODE_T] || k[SDL_SCANCODE_G],k);
-    for (size_t i=0;i<key_map.count;++i) {
-        const int source=key_map.entries[i].source;
-        const bool down=source>=MOUSE_SOURCE ? source<MOUSE_SOURCE_END && (mouse>>(source-MOUSE_SOURCE) & 1)
-                                             : source<SDL_SCANCODE_COUNT && k[source];
-        if (down) d->buttons|=key_map.entries[i].ps;
+
+    const uint32_t mouse=sample_mouse(d,motion.mode || (k && (k[SDL_SCANCODE_T] || k[SDL_SCANCODE_G])),k);
+
+    /* Guarantee default mouse bindings (LMB=R2, RMB=L2, MMB=R3) even when keyboard actions are set to none */
+    if (!mouse_pad.active) {
+        if ((mouse >> (MOUSE_LEFT - MOUSE_SOURCE)) & 1) d->buttons |= BTN_R2;
+        if ((mouse >> (MOUSE_RIGHT - MOUSE_SOURCE)) & 1) d->buttons |= BTN_L2;
+        if ((mouse >> (MOUSE_MIDDLE - MOUSE_SOURCE)) & 1) d->buttons |= BTN_R3;
     }
+
+    bool rx_neg=false, rx_pos=false, ry_neg=false, ry_pos=false;
+    if (k) {
+        for (size_t i=0;i<key_map.count;++i) {
+            const int source=key_map.entries[i].source;
+            const bool down=source>=MOUSE_SOURCE ? source<MOUSE_SOURCE_END && (mouse>>(source-MOUSE_SOURCE) & 1)
+                                                 : source<SDL_SCANCODE_COUNT && k[source];
+            if (down) {
+                uint32_t ps = key_map.entries[i].ps;
+                if (ps == KEY_STICK_RX_NEG) rx_neg = true;
+                else if (ps == KEY_STICK_RX_POS) rx_pos = true;
+                else if (ps == KEY_STICK_RY_NEG) ry_neg = true;
+                else if (ps == KEY_STICK_RY_POS) ry_pos = true;
+                else d->buttons |= ps;
+            }
+        }
+        key_axis(&d->left_x,k[SDL_SCANCODE_A],k[SDL_SCANCODE_D]);
+        key_axis(&d->left_y,k[SDL_SCANCODE_W],k[SDL_SCANCODE_S]);
+        if (rx_neg || rx_pos) key_axis(&d->right_x, rx_neg, rx_pos);
+        if (ry_neg || ry_pos) key_axis(&d->right_y, ry_pos, ry_neg);
+    }
+
+    /* Keep analog trigger levels full when R2/L2 buttons are held */
     if (d->buttons & BTN_L2) d->l2=255;
     if (d->buttons & BTN_R2) d->r2=255;
-    key_axis(&d->left_x,k[SDL_SCANCODE_A],k[SDL_SCANCODE_D]);
-    key_axis(&d->left_y,k[SDL_SCANCODE_W],k[SDL_SCANCODE_S]);
-    key_axis(&d->right_x,k[SDL_SCANCODE_LEFT],k[SDL_SCANCODE_RIGHT]);
-    key_axis(&d->right_y,k[SDL_SCANCODE_UP],k[SDL_SCANCODE_DOWN]);
-    if (k[SDL_SCANCODE_T] || k[SDL_SCANCODE_G]) d->right_x=d->right_y=128;
+
     apply_swipe(d,g,k);
     apply_mouse_touch(d);
 }

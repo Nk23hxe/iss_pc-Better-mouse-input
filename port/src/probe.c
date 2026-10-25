@@ -45,10 +45,10 @@ static LinkedModule modules[16];
 static uint64_t module_count;
 static int entered_game;
 static int gpu_enabled;
-static unsigned cpu_missing_sets; /* CPU_SET_* the host lacks; the guest code needs them rewritten */
-static IsaTable *isa_table; /* rewritten sites (--isa-rewrite); the fault handlers and the report read it */
+static unsigned cpu_missing_sets;
+static IsaTable *isa_table;
 #ifndef _WIN32
-static uintptr_t guest_code_end; /* end of the image and its stub areas (emulation, red zone); TLG_CLOBBER_RED_ZONE */
+static uintptr_t guest_code_end;
 #endif
 static void isa_report_hook(void) { isa_rewrite_report(isa_table, stdout); }
 int vulkan_smoke(void);
@@ -101,17 +101,13 @@ static ABI __attribute__((noreturn)) void unresolved(uint32_t id, uintptr_t argu
     puts(entered_game ? "Original guest entry instructions executed; game initialization is incomplete." :
                         "Native libc initialization is incomplete; game entry has not run.");
     fflush(NULL);
-    _exit(20); /* no destructors: GPU, audio and guest threads are still running */
+    _exit(20);
 }
-/* TLG_IMPORT_TRACE=<n>: each import the host runtime resolves goes through a stub that logs the
- * call (name, first four integer arguments, caller offset) for its first n calls, then jumps to
- * the implementation. Shows which system call precedes a guest fault during bring-up. */
 static unsigned char *trace_stubs;
 static uintptr_t *trace_made;
 static uint32_t *trace_counts, trace_limit;
 #define TRACE_STUB_SIZE 192
 static ABI void trace_import(uint32_t index, const uint64_t *regs) {
-    /* regs: rax, r9, r8, rcx, rdx, rsi, rdi, return address */
     if (__atomic_fetch_add(&trace_counts[index], 1, __ATOMIC_RELAXED) >= trace_limit) return;
     fprintf(stderr, "IMPORT %s(%#" PRIx64 ", %#" PRIx64 ", %#" PRIx64 ", %#" PRIx64 ") from +%#" PRIxPTR "\n",
             runtime_import_name(names[index]), regs[6], regs[5], regs[4], regs[3], (uintptr_t)regs[7] - (uintptr_t)image);
@@ -138,7 +134,6 @@ static uintptr_t trace_stub(uint64_t index, uintptr_t target) {
     return trace_made[index] = (uintptr_t)t;
 }
 #ifndef _WIN32
-/* enter_on_stack(entry, arg0, arg1, stack_top): call entry(arg0,arg1) on a new stack. */
 void enter_on_stack(void *entry, void *arg0, void *arg1, void *top);
 __asm__(".text\n.globl enter_on_stack\nenter_on_stack:\n"
         " push %rbp\n mov %rsp,%rbp\n and $-16,%rcx\n mov %rcx,%rsp\n"
@@ -185,7 +180,6 @@ static LONG fatal_exception(EXCEPTION_POINTERS *info) {
     fprintf(stderr,"  rax=%016llx rbx=%016llx rcx=%016llx rdx=%016llx\n  rsi=%016llx rdi=%016llx rbp=%016llx rsp=%016llx\n",
             c->Rax,c->Rbx,c->Rcx,c->Rdx,c->Rsi,c->Rdi,c->Rbp,c->Rsp);
     if (gpu_enabled) tlggpu_dump_guest_writes(info);
-    /* rbp chain (guest and host code keep frame pointers). */
     uintptr_t rbp=(uintptr_t)c->Rbp;
     for (int depth=0; depth<24 && rbp; ++depth) {
         uintptr_t frame[2];
@@ -200,7 +194,6 @@ static LONG fatal_exception(EXCEPTION_POINTERS *info) {
     TerminateProcess(GetCurrentProcess(),3);
     return EXCEPTION_CONTINUE_SEARCH;
 }
-/* CONTEXT <-> IsaRegs (gpr in x86 numbering). */
 static void isa_context_regs(CONTEXT *c, IsaRegs *regs, int to_context) {
     DWORD64 *g[16]={&c->Rax,&c->Rcx,&c->Rdx,&c->Rbx,&c->Rsp,&c->Rbp,&c->Rsi,&c->Rdi,
                     &c->R8,&c->R9,&c->R10,&c->R11,&c->R12,&c->R13,&c->R14,&c->R15};
@@ -211,7 +204,6 @@ static LONG CALLBACK vectored_fault(EXCEPTION_POINTERS *info) {
     const EXCEPTION_RECORD *record=info->ExceptionRecord;
     DWORD code=record->ExceptionCode;
     if (code==EXCEPTION_BREAKPOINT && isa_table) {
-        /* An int3 ISA site: emulated here; any other breakpoint goes on to the report below. */
         IsaRegs regs;
         uintptr_t rip;
         isa_context_regs(info->ContextRecord,&regs,0);
@@ -223,11 +215,8 @@ static LONG CALLBACK vectored_fault(EXCEPTION_POINTERS *info) {
         }
     }
     if (code==EXCEPTION_ACCESS_VIOLATION && record->NumberParameters>=2) {
-        /* GPU page tracking (write-protected guest pages) is resolved first. */
         if (gpu_enabled && tlggpu_handle_fault(info,(void *)record->ExceptionInformation[1])) return EXCEPTION_CONTINUE_EXECUTION;
         if (runtime_fault_recover) {
-            /* A speculative guest memory read (GPU draw preparation) faulted: the thread resumes
-             * in tlg_longjmp, outside the exception dispatcher, back at its recovery point. */
             unsigned long long *buffer=*runtime_fault_recover;
             runtime_fault_recover=NULL;
             CONTEXT *c=info->ContextRecord;
@@ -240,8 +229,6 @@ static LONG CALLBACK vectored_fault(EXCEPTION_POINTERS *info) {
     }
     if (code==EXCEPTION_ACCESS_VIOLATION || code==EXCEPTION_ILLEGAL_INSTRUCTION || code==EXCEPTION_PRIV_INSTRUCTION ||
         code==EXCEPTION_STACK_OVERFLOW || code==EXCEPTION_INT_DIVIDE_BY_ZERO || code==EXCEPTION_DATATYPE_MISALIGNMENT) {
-        /* Faults in guest code, the loader or the runtime end the process with a report; drivers
-         * and system libraries may handle their own exceptions. */
         uintptr_t rip=(uintptr_t)info->ContextRecord->Rip;
         HMODULE self=GetModuleHandleA(NULL), module=NULL;
         int ours=(image && rip-(uintptr_t)image<0x20000000) ||
@@ -249,16 +236,12 @@ static LONG CALLBACK vectored_fault(EXCEPTION_POINTERS *info) {
                  !module;
         if (ours) return fatal_exception(info);
     }
-    /* TLG_STRICT_HANDLES=1: a closed or invalid handle used anywhere is reported (diagnostics). */
-    if (code==0xC0000008 /* STATUS_INVALID_HANDLE */) return fatal_exception(info);
+    if (code==0xC0000008) return fatal_exception(info);
     return EXCEPTION_CONTINUE_SEARCH;
 }
 static LONG WINAPI unhandled_fault(EXCEPTION_POINTERS *info) { return fatal_exception(info); }
-/* Guest code reads its TCB with `mov reg, gs:[0]` (link_*.py rewrote fs:[0]); on Windows
- * the displacement becomes the TEB TLS slot that holds the guest TCB (runtime_thread.c). */
 uint32_t runtime_thread_tcb_offset(void);
 static uint64_t patch_tcb_loads(const Segment *segments, uint64_t count) {
-    /* gs, REX.W (48/4c), 8b, ModRM mod=00 rm=100 (any register), SIB 25, disp32 0. */
     static const unsigned char zero[4]={0};
     uint32_t displacement=runtime_thread_tcb_offset();
     uint64_t patched=0;
@@ -273,15 +256,8 @@ static uint64_t patch_tcb_loads(const Segment *segments, uint64_t count) {
 }
 #endif
 #ifndef _WIN32
-/* ucontext gregs of IsaRegs.gpr (x86 numbering). */
 static const int isa_gregs[16]={REG_RAX,REG_RCX,REG_RDX,REG_RBX,REG_RSP,REG_RBP,REG_RSI,REG_RDI,
                                 REG_R8,REG_R9,REG_R10,REG_R11,REG_R12,REG_R13,REG_R14,REG_R15};
-/* TLG_CLOBBER_RED_ZONE=<bytes> (test, Linux): after each guest fault the handler resolved (GPU page
- * tracking, int3 ISA sites), zero that many bytes below the interrupted rsp, as Windows' exception
- * dispatch overwrites them: reproduces the Windows-only corruption here ("1" = the 128-byte red
- * zone). Over 128 bytes the handler needs an alternate signal stack (the kernel's frame starts 128
- * bytes below rsp): each guest thread gets one; elsewhere the clobber stays at 128. The first
- * distinct guest RIPs are logged. */
 static unsigned clobber_red_zone;
 static void clobber_thread_init(void) {
     if (clobber_red_zone <= 128) return;
@@ -314,18 +290,13 @@ static void clobber_below(ucontext_t *uc) {
 }
 static void fault(int sig, siginfo_t *info, void *context) {
     if (sig == SIGTRAP && isa_table) {
-        /* An int3 ISA site (RIP is past the CC byte); any other trap ends in the report below. */
         greg_t *g = ((ucontext_t *)context)->uc_mcontext.gregs;
         IsaRegs regs;
         uintptr_t rip;
         for (int i = 0; i < 16; ++i) regs.gpr[i] = (uint64_t)g[isa_gregs[i]];
         regs.rflags = (uint64_t)g[REG_EFL];
-        /* XMM0-15 of the signal frame (FXSAVE layout at 160): an SSE4A site changes one of them,
-         * and the kernel restores them on return. */
         unsigned char *fpu = (unsigned char *)((ucontext_t *)context)->uc_mcontext.fpregs;
         if (isa_rewrite_trap(isa_table, (uintptr_t)g[REG_RIP] - 1, &regs, fpu ? fpu + 160 : NULL, &rip)) {
-            /* XSAVE frame (FP_XSTATE_MAGIC1): XSTATE_BV bit 1 (SSE) set, or XRSTOR would reset the
-             * XMM registers instead of loading the changed ones. XSAVE wrote their real values. */
             uint32_t magic;
             if (fpu && (memcpy(&magic, fpu + 464, 4), magic == 0x46505853u)) fpu[512] |= 2;
             for (int i = 0; i < 16; ++i) g[isa_gregs[i]] = (greg_t)regs.gpr[i];
@@ -335,10 +306,6 @@ static void fault(int sig, siginfo_t *info, void *context) {
             return;
         }
     }
-    /* A speculative guest memory read (GPU draw-preparation workers) failed: resume its recovery
-     * point before any readback. With precise readbacks the page may be read-protected because
-     * the GPU wrote it; flushing it from a GPU worker waits on that worker's own pipeline
-     * (deadlock), while giving up leaves the draw to the GPU thread, which reads it safely. */
     if ((sig == SIGSEGV || sig == SIGBUS) && runtime_fault_recover) {
         sigjmp_buf *recover = runtime_fault_recover;
         runtime_fault_recover = NULL;
@@ -348,12 +315,10 @@ static void fault(int sig, siginfo_t *info, void *context) {
         pthread_sigmask(SIG_UNBLOCK, &unblock, NULL);
         siglongjmp(*recover, 1);
     }
-    /* GPU page tracking (write-protected guest pages) is resolved next. */
     if (gpu_enabled && sig == SIGSEGV && tlggpu_handle_fault(context, info->si_addr)) {
         clobber_below(context);
         return;
     }
-    /* The process is terminating: dladdr/snprintf are acceptable here. */
     ucontext_t *uc = context;
     uintptr_t rip = (uintptr_t)uc->uc_mcontext.gregs[REG_RIP];
     char line[512];
@@ -376,8 +341,6 @@ static void fault(int sig, siginfo_t *info, void *context) {
         snprintf(line, sizeof(line), "Fault (signal %d) at RIP %p, address %p\n", sig, (void *)rip, info->si_addr);
     { ssize_t written_=write(2, line, strlen(line)); (void)written_; }
     if (gpu_enabled) tlggpu_dump_guest_writes(context);
-    /* Engine ASSERT (int 0x41): the formatted "file(line): func() ASSERT(cond)" message sits in a
-     * stack buffer of the asserting frame; its logger may be null, so print it from here. */
     if (rip - (uintptr_t)image < 0x10000000) {
         unsigned char op[2] = {0};
         struct iovec lo = {op, 2}, ro = {(void *)rip, 2};
@@ -399,7 +362,6 @@ static void fault(int sig, siginfo_t *info, void *context) {
             }
         }
     }
-    /* Guest call chain: the eboot keeps frame pointers, so follow rbp (reads cannot fault). */
     if (rip - (uintptr_t)image < 0x10000000) {
         uintptr_t rbp = (uintptr_t)uc->uc_mcontext.gregs[REG_RBP];
         static const char *regs[] = {"rax","rbx","rcx","rdx","rsi","rdi","rbp","rsp"};
@@ -420,7 +382,6 @@ static void fault(int sig, siginfo_t *info, void *context) {
             rbp = frame[0];
         }
     }
-    /* Host call chain (frames with unwind info; guest frames end it). */
     void *frames[32];
     int depth = backtrace(frames, 32);
     for (int i = 2; i < depth; ++i) {
@@ -436,8 +397,6 @@ static void fault(int sig, siginfo_t *info, void *context) {
 }
 #endif
 #ifndef _WIN32
-/* Watchdog: dump RIP and the rbp frame chain of every thread (guest offsets
- * when inside the image). Reads use process_vm_readv so bad frames cannot fault. */
 static uintptr_t exe_base;
 static void write_hex(char *out, uint64_t v) {
     const char digits[] = "0123456789abcdef";
@@ -447,11 +406,10 @@ static void dump_frames(ucontext_t *uc) {
     char line[] = "  tid=0000000000000000 rip=0000000000000000 image-relative=0000000000000000 host-relative=0000000000000000\n";
     uintptr_t rip=(uintptr_t)uc->uc_mcontext.gregs[REG_RIP], rbp=(uintptr_t)uc->uc_mcontext.gregs[REG_RBP];
     uint64_t tid=(uint64_t)gettid();
-    /* First argument register: the lock address when a thread waits on a futex. */
     char arg[]="  tid=0000000000000000 rdi=0000000000000000\n";
     write_hex(arg+6,tid); write_hex(arg+27,(uint64_t)uc->uc_mcontext.gregs[REG_RDI]);
     { ssize_t written_=write(2,arg,sizeof(arg)-1); (void)written_; }
-    {   /* Thread name (the process is terminating: stdio-free reads are enough). */
+    {
         char path[64], name[32]={0};
         snprintf(path,sizeof(path),"/proc/self/task/%lu/comm",(unsigned long)tid);
         int fd=open(path,O_RDONLY);
@@ -500,7 +458,6 @@ static void watchdog(int sig, siginfo_t *info, void *context) {
     dump_all_threads(context, "STOP: watchdog timeout; thread stacks:\n");
     _exit(128 + sig);
 }
-/* kill -USR1 <pid>: dump every thread's stack into the log and keep running (diagnose hangs). */
 static void dump_request(int sig, siginfo_t *info, void *context) {
     (void)sig; (void)info;
     dump_all_threads(context, "DUMP: thread stacks on request (SIGUSR1); the game keeps running\n");
@@ -508,7 +465,6 @@ static void dump_request(int sig, siginfo_t *info, void *context) {
     ssize_t written_=write(2,tail,sizeof(tail)-1); (void)written_;
 }
 #endif
-/* param.sfo lookup: string or integer value of key, 0 when absent. */
 static int sfo_value(const char *path, const char *key, char *text, size_t text_size, uint32_t *number) {
     FILE *f=fopen(path,"rb");
     if (!f) return 0;
@@ -597,8 +553,6 @@ static void install_cheats(const char *app0, Segment *segments, uint64_t count, 
     }
 }
 
-/* Damage hook for the enemy health bar (src/actor_hook.h). Always
- * installed when the code matches: it only records values; the overlay decides what to show. */
 static void install_actor_watch(const char *app0, Segment *segments, uint64_t count, uint64_t size) {
     char path[4096], serial[32] = "", version[32] = "";
     snprintf(path, sizeof(path), "%s/sce_sys/param.sfo", app0 ? app0 : ".");
@@ -641,8 +595,6 @@ static void install_orb_multiplier(const char *app0, Segment *segments, uint64_t
     for (unsigned i = 0; i < 3; ++i) {
         if (!mapped(segments, count, tlg_orb_calls[i], 5)) return;
     }
-    /* SysV call sites: preserve the receiver across the helper, then tail-call the original
-     * setter. Its cap and upgrade notifications remain in the game's own code. */
     unsigned char *stub = allocate(page_size);
     uintptr_t helper = (uintptr_t)tlg_orbs_gain, setter = (uintptr_t)(image + 0x6a9f0);
     unsigned char code[26];
@@ -664,8 +616,6 @@ static void install_orb_multiplier(const char *app0, Segment *segments, uint64_t
     printf("Red orbs: live multiplier ready (3 validated gain paths, 0.1x to 100x)\n");
 }
 
-/* Writes a jump from image+at to `stub`; the rest of the replaced bytes become nops (the stub
- * replays them). 0 when the stub is out of relative-jump range. */
 static int install_jump(uint64_t at, unsigned length, unsigned char *stub) {
     const int64_t delta = (int64_t)(uintptr_t)stub - (int64_t)(uintptr_t)(image + at + 5);
     if (delta < INT32_MIN || delta > INT32_MAX) return 0;
@@ -676,101 +626,6 @@ static int install_jump(uint64_t at, unsigned length, unsigned char *stub) {
     return 1;
 }
 
-/* Direct mouse aim trampoline builder: redirects camera updating to runtime_mouse_aim_camera */
-static void install_iss_mouse_aim(const char *app0, Segment *segments, uint64_t count, uint64_t size) {
-    const char *enabled = getenv("ISS_DIRECT_MOUSE_AIM");
-    if (enabled && !strcmp(enabled, "0")) return;
-
-    char path[4096], serial[32] = "", version[32] = "";
-    snprintf(path, sizeof(path), "%s/sce_sys/param.sfo", app0 ? app0 : ".");
-    sfo_value(path, "TITLE_ID", serial, sizeof(serial), NULL);
-    sfo_value(path, "APP_VER", version, sizeof(version), NULL);
-
-    int executable = 0, writable = 0;
-    for (uint64_t i = 0; i < count; i++) {
-        if ((segments[i].flags & 1) && segments[i].address <= 0x14936eu &&
-            ISS_MOUSE_SITE + ISS_MOUSE_STOLEN <= segments[i].address + segments[i].size) executable = 1;
-        if ((segments[i].flags & 2) && segments[i].address <= 0xe16c40u &&
-            0xe16c40u < segments[i].address + segments[i].size) writable = 1;
-    }
-
-    const int valid_title = !strcmp(serial, "CUSA00223") || !strcmp(serial, "CUSA00004");
-    if (!valid_title || strcmp(version, "01.07") || !executable || !writable ||
-        !iss_mouse_signature(image, size)) {
-        puts("Direct mouse: incompatible title/code/mapping; mouse-to-stick fallback retained");
-        return;
-    }
-
-    unsigned char *bridge = allocate(page_size);
-    unsigned char *p = bridge;
-
-    /* Prologue: preserve registers and align stack */
-    unsigned char prologue[] = {
-        0x50, 0x51, 0x52, 0x56, 0x57, 0x41, 0x50, 0x41, 0x51, 0x41, 0x52, 0x41, 0x53,
-        0x48, 0x81, 0xec, 0x60, 0x00, 0x00, 0x00,
-        0x0f, 0x29, 0x04, 0x24,
-        0x0f, 0x29, 0x4c, 0x24, 0x10,
-        0x0f, 0x29, 0x54, 0x24, 0x20,
-        0x0f, 0x29, 0x5c, 0x24, 0x30
-    };
-    memcpy(p, prologue, sizeof(prologue)); p += sizeof(prologue);
-
-    /* Setup arguments for runtime_mouse_aim_camera:
-       rcx (MSABI) / rdi (SysV) = rbp + 0x330 (camera angles)
-       rdx (MSABI) / rsi (SysV) = rsp + 0x2f0 (camera data)
-       r8  (MSABI) / rdx (SysV) = rsp + 0x158 (camera context) */
-#ifdef _WIN32
-    *p++ = 0x48; *p++ = 0x8d; *p++ = 0x8d; *p++ = 0x30; *p++ = 0x03; *p++ = 0x00; *p++ = 0x00;
-    *p++ = 0x48; *p++ = 0x8d; *p++ = 0x94; *p++ = 0x24; *p++ = 0xf0; *p++ = 0x02; *p++ = 0x00; *p++ = 0x00;
-    *p++ = 0x4c; *p++ = 0x8d; *p++ = 0x84; *p++ = 0x24; *p++ = 0x58; *p++ = 0x01; *p++ = 0x00; *p++ = 0x00;
-#else
-    *p++ = 0x48; *p++ = 0x8d; *p++ = 0xbd; *p++ = 0x30; *p++ = 0x03; *p++ = 0x00; *p++ = 0x00;
-    *p++ = 0x48; *p++ = 0x8d; *p++ = 0xb4; *p++ = 0x24; *p++ = 0xf0; *p++ = 0x02; *p++ = 0x00; *p++ = 0x00;
-    *p++ = 0x48; *p++ = 0x8d; *p++ = 0x94; *p++ = 0x24; *p++ = 0x58; *p++ = 0x01; *p++ = 0x00; *p++ = 0x00;
-#endif
-
-    /* Call runtime_mouse_aim_camera */
-    uintptr_t target = (uintptr_t)runtime_mouse_aim_camera;
-    *p++ = 0x48; *p++ = 0xb8;
-    memcpy(p, &target, 8); p += 8;
-    *p++ = 0xff; *p++ = 0xd0;
-
-    /* Epilogue: restore SIMD and general registers */
-    unsigned char epilogue[] = {
-        0x0f, 0x28, 0x04, 0x24,
-        0x0f, 0x28, 0x4c, 0x24, 0x10,
-        0x0f, 0x28, 0x54, 0x24, 0x20,
-        0x0f, 0x28, 0x5c, 0x24, 0x30,
-        0x48, 0x81, 0xc4, 0x60, 0x00, 0x00, 0x00,
-        0x41, 0x5b, 0x41, 0x5a, 0x41, 0x59, 0x41, 0x58, 0x5f, 0x5e, 0x5a, 0x59, 0x58
-    };
-    memcpy(p, epilogue, sizeof(epilogue)); p += sizeof(epilogue);
-
-    /* Replay stolen 18 bytes from 0x14ebce */
-    unsigned char stolen[] = {
-        0xc5, 0xf8, 0x11, 0x84, 0x24, 0x00, 0x01, 0x00, 0x00,
-        0xc4, 0xc1, 0x78, 0x11, 0x85, 0x30, 0x03, 0x00, 0x00
-    };
-    memcpy(p, stolen, sizeof(stolen)); p += sizeof(stolen);
-
-    /* Jump back to guest code */
-    uintptr_t resume = (uintptr_t)(image + ISS_MOUSE_SITE + ISS_MOUSE_STOLEN);
-    *p++ = 0xff; *p++ = 0x25;
-    memset(p, 0, 4); p += 4;
-    memcpy(p, &resume, 8); p += 8;
-
-    protect(bridge, page_size, 5);
-
-    if (!install_jump(ISS_MOUSE_SITE, ISS_MOUSE_STOLEN, bridge)) {
-        puts("Direct mouse: hook outside jump range");
-        return;
-    }
-    runtime_mouse_aim_attach((uintptr_t)image);
-    puts("Direct mouse: guarded US/EU 1.07 angle input enabled; Controls sensitivity/invert apply; controller unchanged");
-}
-
-/* Damage dealt/taken and green/blue/gold orb multipliers (src/damage_hook.h, src/orb_hook.h):
- * the stubs read the menu's floats directly, so changes apply on the next hit or pickup. */
 static void install_stat_multipliers(const char *app0, Segment *segments, uint64_t count, uint64_t size) {
     char path[4096], serial[32] = "", version[32] = "";
     snprintf(path, sizeof(path), "%s/sce_sys/param.sfo", app0 ? app0 : ".");
@@ -803,15 +658,13 @@ extern uintptr_t tlg_view_region_params(void);
 extern uintptr_t tlg_view_fade_inverse(void);
 extern void tlg_view_attach(unsigned char *guest_image);
 
-/* Draw distance, LOD and clip planes (src/view_hook.h): the menu's values reach the game's data
- * through tlg_view_attach; the regions' LOD_ADJUST and FADE_DISTANCE go through four stubs. */
 static void install_view_tuning(Segment *segments, uint64_t count, uint64_t size) {
     if (!mapped(segments, count, TLG_VIEW_LOD_TABLE, TLG_VIEW_LOD_ROWS * TLG_VIEW_LOD_STRIDE) ||
         !mapped(segments, count, TLG_VIEW_BANDS, 4 * TLG_VIEW_BAND_COUNT) ||
         !mapped(segments, count, TLG_VIEW_NEAR_CLIP, 8) ||
         !mapped(segments, count, tlg_view_region_sites[1], sizeof(tlg_view_region_code)) ||
         !tlg_view_signature_match(image, size)) {
-        return; /* another game or build: silent, like the other hooks of other games */
+        return;
     }
     unsigned char *stubs = allocate(page_size);
     const uint32_t *sites[2] = {tlg_view_region_sites, tlg_view_fade_sites};
@@ -837,9 +690,6 @@ static void install_view_tuning(Segment *segments, uint64_t count, uint64_t size
     printf("Draw distance: ready (LOD scale, LOD bands, region LOD_ADJUST and FADE_DISTANCE, near/far clip)\n");
 }
 
-/* G3PATCH2 (patches.py): the patches' image base, then byte writes at image offsets, applied
- * after relocation. A write may replace a whole base-relative pointer slot (60/90 FPS++ swap
- * function pointers): the patch holds the address at the patches' base, rebased here. */
 static void apply_patches(const char *path, Segment *segments, uint64_t ns, const Reloc *relocs, uint64_t nr) {
     FILE *f=fopen(path,"rb");
     char magic[8];
@@ -873,18 +723,14 @@ static void apply_patches(const char *path, Segment *segments, uint64_t ns, cons
     fclose(f);
     printf("Patches: %" PRIu64 " writes, %" PRIu64 " bytes applied, %" PRIu64 " pointers rebased\n",count,bytes,rebased);
 }
-/* Restarts the game through run.sh (the settings menu: a new render resolution is a patch
- * applied at start). Descriptors are closed first so the old GPU device and its memory are
- * released before the new process opens its own. */
+
 void runtime_restart(void) {
     fflush(NULL);
 #ifdef _WIN32
-    /* run.py sets TLG_RESTART_COMMAND: the launch command line, started again (new patches). */
     const char *command=getenv("TLG_RESTART_COMMAND");
     puts("Runtime: restarting through run.py");
     if (!command || !*command) { fputs("runtime_restart: TLG_RESTART_COMMAND is not set\n",stderr); _exit(1); }
     char *line=_strdup(command);
-    /* Same output handles: a launcher reading the game's log keeps reading the new launch. */
     STARTUPINFOA startup={.cb=sizeof(startup),.dwFlags=STARTF_USESTDHANDLES,
                           .hStdInput=GetStdHandle(STD_INPUT_HANDLE),.hStdOutput=GetStdHandle(STD_OUTPUT_HANDLE),
                           .hStdError=GetStdHandle(STD_ERROR_HANDLE)};
@@ -893,7 +739,6 @@ void runtime_restart(void) {
         fprintf(stderr,"runtime_restart: CreateProcess failed (%lu)\n",GetLastError()); _exit(1);
     }
     CloseHandle(process.hThread); CloseHandle(process.hProcess);
-    /* The new launch waits for this process's GPU device to go away (run.py --after). */
     TerminateProcess(GetCurrentProcess(),0);
 #else
     puts("Runtime: restarting through run.sh");
@@ -904,9 +749,6 @@ void runtime_restart(void) {
 #endif
 }
 
-/* The guest code needs the PS4's instruction sets (#33, #66); TLG_CPU_CHECK=0 skips this. A
- * missing fatal set prints STOP and returns 0; the rewritable ones go to cpu_missing_sets, named
- * in missing. */
 static int cpu_supported(char *missing, size_t size) {
     missing[0] = 0;
     const char *check = getenv("TLG_CPU_CHECK");
@@ -921,9 +763,6 @@ static int cpu_supported(char *missing, size_t size) {
     return 1;
 }
 
-/* Per-game environment prefix (inFAMOUS: ISS_). The core still reads TLG_* (renamed to a shared
- * prefix once every port uses ps4_core), so each ISS_X is copied to TLG_X at start, unless
- * TLG_X is set too. */
 #ifndef PORT_ENV_PREFIX
 #define PORT_ENV_PREFIX "ISS_"
 #endif
@@ -936,7 +775,7 @@ static void alias_port_environment(void) {
     const size_t prefix = strlen(PORT_ENV_PREFIX);
     size_t count = 0;
     while (environ && environ[count]) ++count;
-    char **copy = calloc(count + 1, sizeof(*copy)); /* setenv may reallocate environ */
+    char **copy = calloc(count + 1, sizeof(*copy));
     if (!copy) return;
     for (size_t i = 0; i < count; ++i) copy[i] = strdup(environ[i]);
     for (size_t i = 0; i < count; ++i) {
@@ -959,13 +798,6 @@ static void alias_port_environment(void) {
     free(copy);
 }
 
-/* Detailed log mode (ISS_VERBOSE_LOG=1 or 2, copied to TLG_VERBOSE_LOG above): turns on the
- * bounded trace switches that are safe together and asks the GPU log for debug (1) or trace (2).
- * A variable the player already set is never overwritten. Switches left off on purpose, because
- * they change behavior or are heavy single-subsystem debugging: TLG_IMPORT_TRACE (reroutes every
- * import call through a stub), TLG_WRITE_LOG (ring buffer plus scans on every GPU write),
- * TLG_REGION_TRACE (writes a file), TLG_DEBUG_MOTION (draws a debug overlay), TLG_SCENE_DEBUG
- * (dumps frames and deletes the trigger file). */
 static void verbose_default(const char *name, const char *value, char *list, size_t size) {
     if (getenv(name)) return;
 #ifdef _WIN32
@@ -982,20 +814,19 @@ static void apply_verbose_log(void) {
     if (level <= 0) return;
     char list[512] = "";
     verbose_default("TLG_GPU_LOG", level >= 2 ? "trace" : "debug", list, sizeof list);
-    verbose_default("TLG_AUDIO_TRACE", "1", list, sizeof list);        /* 400 lines: sound opens, Ajm */
-    verbose_default("TLG_MOD_TRACE", "1", list, sizeof list);          /* 32 lines, only with TLG_MODS_DIR */
-    verbose_default("TLG_OCCLUSION_LOG", "1", list, sizeof list);      /* first 48 events, then 1 in 2000 */
-    verbose_default("TLG_MOTION_SELECT_LOG", "1", list, sizeof list);  /* one line per G-buffer shader */
-    verbose_default("TLG_PIPELINE_LOG", "1", list, sizeof list);       /* one line per pipeline built */
+    verbose_default("TLG_AUDIO_TRACE", "1", list, sizeof list);
+    verbose_default("TLG_MOD_TRACE", "1", list, sizeof list);
+    verbose_default("TLG_OCCLUSION_LOG", "1", list, sizeof list);
+    verbose_default("TLG_MOTION_SELECT_LOG", "1", list, sizeof list);
+    verbose_default("TLG_PIPELINE_LOG", "1", list, sizeof list);
     if (level >= 2) {
-        verbose_default("TLG_TRACE_SEMA", "1", list, sizeof list);     /* capped at 2000 lines by the runtime */
-        verbose_default("TLG_JSON_LOG", "1", list, sizeof list);       /* sce::Json serialize results */
-        verbose_default("TLG_MOUSE_LOG", "1", list, sizeof list);      /* 4 lines/s while the mouse is used */
-        verbose_default("TLG_RECORDER_TRACE", "1", list, sizeof list); /* top callers every 2000 recordings */
+        verbose_default("TLG_TRACE_SEMA", "1", list, sizeof list);
+        verbose_default("TLG_JSON_LOG", "1", list, sizeof list);
+        verbose_default("TLG_MOUSE_LOG", "1", list, sizeof list);
+        verbose_default("TLG_RECORDER_TRACE", "1", list, sizeof list);
     }
     printf("Verbose log: on (level %d); switches: %s\n", level, list[0] ? list : "(all already set by the user)");
 }
-/* Detailed log mode: boot step with the time since the first one (ms). */
 static void boot_step(const char *what) {
     if (!runtime_verbose()) return;
     static struct timespec start;
@@ -1015,8 +846,6 @@ int main(int argc, char **argv) {
     apply_verbose_log();
     boot_step("start");
 #ifndef _WIN32
-    /* Keep host heap objects handed to the guest (thread handles, TLS) in the
-       non-PIE brk heap, i.e. below 1 TiB: the guest packs pointers into 40 bits. */
     mallopt(M_ARENA_MAX,1);
     mallopt(M_MMAP_THRESHOLD,32*1024*1024);
 #endif
@@ -1029,13 +858,10 @@ int main(int argc, char **argv) {
         return 0;
     }
     if (argc == 2 && !strcmp(argv[1], "--gamepad")) {
-        /* Before the memory reservation: this only asks SDL, nothing of the game is set up yet. */
         runtime_pad_describe();
         return 0;
     }
 #ifdef _WIN32
-    /* The PS4 user range must stay free of host allocations (GPU driver, heaps), and the guest
-     * TCB needs one of the 64 TEB TLS slots before DLLs (Vulkan drivers) take them. */
     runtime_memory_reserve();
     runtime_thread_tcb_offset();
 #endif
@@ -1053,7 +879,6 @@ int main(int argc, char **argv) {
         else if (!strcmp(argv[i], "--patches") && i+1<argc) patch_file=argv[++i];
         else if (!strcmp(argv[i], "--isa-rewrite") && i+1<argc) isa_file=argv[++i];
         else if (!strcmp(argv[i], "--mount") && i+1<argc) {
-            /* guest=host; the guest part never has '=', so the first one splits */
             const char *spec=argv[++i], *eq=strchr(spec,'=');
             if (mount_count==8 || !eq || eq==spec || !eq[1]) { fprintf(stderr, "Bad --mount (guest=host, at most 8): %s\n", spec); return 1; }
             mounts[mount_count++]=spec;
@@ -1066,8 +891,6 @@ int main(int argc, char **argv) {
         return 1;
     }
     {
-        /* The first log line says which build and which game this is (players often can't tell
-         * which zip they ran, or which dump: only CUSA00223 1.07 is supported). */
         char path[4096], serial[32] = "?", version[32] = "?";
         snprintf(path, sizeof(path), "%s/sce_sys/param.sfo", app0 ? app0 : ".");
         sfo_value(path, "TITLE_ID", serial, sizeof(serial), NULL);
@@ -1078,9 +901,6 @@ int main(int argc, char **argv) {
     if (!cpu_supported(missing, sizeof missing)) return 20;
     if (cpu_missing_sets) printf("CPU: missing %s\n", missing);
     boot_step("cpu check done");
-    /* TLG_ISA_REWRITE=0 never rewrites, =1 rewrites every emulated site (MOVBE, BMI1, LZCNT, F16C, SSE4A:
-     * a test on a complete CPU), a list such as "sse4a", "f16c" or "movbe,bmi1" rewrites those sets; by
-     * default the sets the CPU lacks. */
     const char *policy = getenv("TLG_ISA_REWRITE");
     int policy_valid;
     const unsigned isa_forced = cpu_sets_named(policy, &policy_valid);
@@ -1095,10 +915,6 @@ int main(int argc, char **argv) {
         printf("STOP: this CPU lacks %s and no rewrite table matches the image\n", missing);
         return 20;
     }
-    /* Red-zone protection (scripts/red_zone.py, the table's G3RZONE1 section): guest code keeps data
-     * below rsp (SysV red zone) and Windows' exception dispatch overwrites it on every fault (#29,
-     * #41). On by default on Windows; TLG_RED_ZONE_REWRITE=1 forces it (Linux tests, with
-     * TLG_CLOBBER_RED_ZONE), =0 turns it off. */
     const char *red_zone_policy = getenv("TLG_RED_ZONE_REWRITE");
 #ifdef _WIN32
     int red_zone_on = !(red_zone_policy && !strcmp(red_zone_policy, "0"));
@@ -1147,7 +963,7 @@ int main(int argc, char **argv) {
         if (!SetProcessMitigationPolicy(ProcessStrictHandleCheckPolicy,&strict,sizeof(strict)))
             fprintf(stderr,"TLG_STRICT_HANDLES: policy not set (%lu)\n",GetLastError());
     }
-    (void)timeout_seconds; /* no watchdog on Windows */
+    (void)timeout_seconds;
 #else
     page_size = (size_t)sysconf(_SC_PAGESIZE);
     {
@@ -1162,7 +978,7 @@ int main(int argc, char **argv) {
     struct sigaction sa = {0}; sa.sa_sigaction = fault; sa.sa_flags = SA_SIGINFO | (clobber_red_zone > 128 ? SA_ONSTACK : 0);
     sigemptyset(&sa.sa_mask);
     sigaction(SIGSEGV, &sa, NULL); sigaction(SIGILL, &sa, NULL); sigaction(SIGBUS, &sa, NULL);
-    sigaction(SIGTRAP, &sa, NULL); /* int3 ISA sites */
+    sigaction(SIGTRAP, &sa, NULL);
     Dl_info self_info;
     if (dladdr((void *)main,&self_info)) exe_base=(uintptr_t)self_info.dli_fbase;
     struct sigaction dump = {0}; dump.sa_sigaction = thread_dump; dump.sa_flags = SA_SIGINFO|SA_RESTART;
@@ -1171,7 +987,7 @@ int main(int argc, char **argv) {
     sigemptyset(&request.sa_mask); sigaction(SIGUSR1, &request, NULL);
     struct sigaction alarm_action = {0}; alarm_action.sa_sigaction = watchdog; alarm_action.sa_flags = SA_SIGINFO;
     sigemptyset(&alarm_action.sa_mask); sigaction(SIGALRM, &alarm_action, NULL);
-    alarm(timeout_seconds); /* 0 disables the watchdog */
+    alarm(timeout_seconds);
 #endif
     FILE *f = fopen(argv[1], "rb");
     if (!f) fail("cannot open boot file; run prepare.py first");
@@ -1195,7 +1011,6 @@ int main(int argc, char **argv) {
     uint64_t *binding_kinds=calloc(import_count ? import_count : 1,sizeof(*binding_kinds));
     if (!bindings || !binding_kinds) fail("allocation failed");
     if (multi) {
-        /* G3PROBE5: procparam, eboot TLS, module table, bindings (link_modules.py). */
         procparam=read64(f);
         for (int i=0;i<4;++i) main_tls[i]=read64(f);
         module_count=read64(f);
@@ -1374,7 +1189,8 @@ int main(int argc, char **argv) {
     if (gpu_enabled) install_actor_watch(app0, segments, ns, size);
     if (gpu_enabled) install_stat_multipliers(app0, segments, ns, size);
     if (gpu_enabled) install_view_tuning(segments, ns, size);
-    if (gpu_enabled) install_iss_mouse_aim(app0, segments, ns, size);
+    /* Direct assembly hook disabled to prevent EU region register offset crash */
+    /* if (gpu_enabled) install_iss_mouse_aim(app0, segments, ns, size); */
 #ifdef _WIN32
     printf("Guest TCB loads redirected to the TEB TLS slot: %" PRIu64 "\n", patch_tcb_loads(segments, ns));
 #endif
