@@ -626,6 +626,101 @@ static int install_jump(uint64_t at, unsigned length, unsigned char *stub) {
     return 1;
 }
 
+/* 14-byte absolute indirect jump: jmp QWORD PTR [rip+0] */
+static inline void iss_karma_jump(unsigned char *p, uintptr_t target) {
+    const unsigned char op[] = {0xff, 0x25, 0, 0, 0, 0};
+    memcpy(p, op, 6);
+    memcpy(p + 6, &target, 8);
+}
+
+/* Exact AVX + Windows x64 shadow-space aligned bridge from iss_karma.h */
+static inline unsigned iss_karma_bridge_ex(unsigned char *p, uintptr_t helper,
+                                           const unsigned char *original, uintptr_t resume,
+                                           unsigned stolen, int shard_args) {
+    unsigned n = 0;
+    const unsigned char push[] = {
+        0x9c, 0x50, 0x51, 0x52, 0x53, 0x55, 0x56, 0x57,
+        0x41, 0x50, 0x41, 0x51, 0x41, 0x52, 0x41, 0x53, 0x41, 0x54, 0x41, 0x55, 0x41, 0x56, 0x41, 0x57,
+        0x48, 0x89, 0xe3, 0x48, 0x83, 0xe4, 0xe0, 0x48, 0x81, 0xec, 0x20, 0x04, 0, 0
+    };
+    memcpy(p + n, push, sizeof(push)); n += sizeof(push);
+    for (unsigned i = 0; i < 16; ++i) {
+        const unsigned char op[] = {
+            0xc4, (unsigned char)(i < 8 ? 0xe1 : 0x61), 0x7e, 0x7f,
+            (unsigned char)(0x84 + 8 * (i % 8)), 0x24
+        };
+        memcpy(p + n, op, 6); n += 6;
+        uint32_t d = 32 + 32 * i;
+        memcpy(p + n, &d, 4); n += 4;
+    }
+    if (shard_args == 4) {
+        /* Direct camera: editable saved YMM0, camera-data R12, context from original RSP+0x50 */
+        const unsigned char args[] = {
+            0x48, 0x8d, 0x4c, 0x24, 0x20,
+            0x4c, 0x89, 0xe2,
+            0x4c, 0x8b, 0x83, 0xd0, 0, 0, 0
+        };
+        memcpy(p + n, args, sizeof(args)); n += sizeof(args);
+    } else if (shard_args) {
+        const unsigned char args[] = {0x49, 0x89, 0xd0, 0x89, 0xf2, 0x48, 0x89, 0xf9};
+        memcpy(p + n, args, sizeof(args)); n += sizeof(args);
+    }
+    const unsigned char fxsave[] = {0x48, 0x0f, 0xae, 0x84, 0x24, 0x20, 0x02, 0, 0, 0x48, 0xb8};
+    memcpy(p + n, fxsave, sizeof(fxsave)); n += sizeof(fxsave);
+    memcpy(p + n, &helper, 8); n += 8;
+    p[n++] = 0xff; p[n++] = 0xd0;
+    const unsigned char fxrestore[] = {0x48, 0x0f, 0xae, 0x8c, 0x24, 0x20, 0x02, 0, 0};
+    memcpy(p + n, fxrestore, sizeof(fxrestore)); n += sizeof(fxrestore);
+    for (unsigned i = 0; i < 16; ++i) {
+        const unsigned char op[] = {
+            0xc4, (unsigned char)(i < 8 ? 0xe1 : 0x61), 0x7e, 0x6f,
+            (unsigned char)(0x84 + 8 * (i % 8)), 0x24
+        };
+        memcpy(p + n, op, 6); n += 6;
+        uint32_t d = 32 + 32 * i;
+        memcpy(p + n, &d, 4); n += 4;
+    }
+    const unsigned char pop[] = {
+        0x48, 0x89, 0xdc, 0x41, 0x5f, 0x41, 0x5e, 0x41, 0x5d, 0x41, 0x5c,
+        0x41, 0x5b, 0x41, 0x5a, 0x41, 0x59, 0x41, 0x58, 0x5f, 0x5e, 0x5d, 0x5b, 0x5a, 0x59, 0x58, 0x9d
+    };
+    memcpy(p + n, pop, sizeof(pop)); n += sizeof(pop);
+    memcpy(p + n, original, stolen); n += stolen;
+    iss_karma_jump(p + n, resume);
+    return n + 14;
+}
+
+static void install_iss_mouse_aim(const char *app0, Segment *segments, uint64_t count, uint64_t size) {
+    const char *enabled = getenv("ISS_DIRECT_MOUSE_AIM");
+    if (enabled && !strcmp(enabled, "0")) return;
+    char path[4096], serial[32] = "", version[32] = "";
+    snprintf(path, sizeof(path), "%s/sce_sys/param.sfo", app0 ? app0 : ".");
+    sfo_value(path, "TITLE_ID", serial, sizeof(serial), NULL);
+    sfo_value(path, "APP_VER", version, sizeof(version), NULL);
+    int executable = 0, writable = 0;
+    for (uint64_t i = 0; i < count; i++) {
+        if ((segments[i].flags & 1) && segments[i].address <= 0x14936eu &&
+            ISS_MOUSE_SITE + ISS_MOUSE_STOLEN <= segments[i].address + segments[i].size) executable = 1;
+        if ((segments[i].flags & 2) && segments[i].address <= 0xe16c40u &&
+            0xe16c40u < segments[i].address + segments[i].size) writable = 1;
+    }
+    const int valid_title = !strcmp(serial, "CUSA00223") || !strcmp(serial, "CUSA00004");
+    if (!valid_title || strcmp(version, "01.07") || !executable || !writable ||
+        !iss_mouse_signature(image, size)) {
+        puts("Direct mouse: incompatible title/code/mapping; mouse-to-stick fallback retained");
+        return;
+    }
+    unsigned char *bridge = allocate(page_size);
+    unsigned n = iss_karma_bridge_ex(bridge, (uintptr_t)runtime_mouse_aim_camera, image + ISS_MOUSE_SITE,
+                                     (uintptr_t)image + ISS_MOUSE_SITE + ISS_MOUSE_STOLEN, ISS_MOUSE_STOLEN, 4);
+    if (n > page_size) fail("Direct mouse bridge overflow");
+    protect(bridge, page_size, 5);
+    memset(image + ISS_MOUSE_SITE, 0x90, ISS_MOUSE_STOLEN);
+    iss_karma_jump(image + ISS_MOUSE_SITE, (uintptr_t)bridge);
+    runtime_mouse_aim_attach((uintptr_t)image);
+    puts("Direct mouse: guarded US/EU 1.07 angle input enabled; Controls sensitivity/invert apply; controller unchanged");
+}
+
 static void install_stat_multipliers(const char *app0, Segment *segments, uint64_t count, uint64_t size) {
     char path[4096], serial[32] = "", version[32] = "";
     snprintf(path, sizeof(path), "%s/sce_sys/param.sfo", app0 ? app0 : ".");
@@ -1189,8 +1284,7 @@ int main(int argc, char **argv) {
     if (gpu_enabled) install_actor_watch(app0, segments, ns, size);
     if (gpu_enabled) install_stat_multipliers(app0, segments, ns, size);
     if (gpu_enabled) install_view_tuning(segments, ns, size);
-    /* Direct assembly hook disabled to prevent EU region register offset crash */
-    /* if (gpu_enabled) install_iss_mouse_aim(app0, segments, ns, size); */
+    if (gpu_enabled) install_iss_mouse_aim(app0, segments, ns, size);
 #ifdef _WIN32
     printf("Guest TCB loads redirected to the TEB TLS slot: %" PRIu64 "\n", patch_tcb_loads(segments, ns));
 #endif
