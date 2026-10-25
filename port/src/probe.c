@@ -14,6 +14,7 @@
 #include "actor_hook.h"
 #include "damage_hook.h"
 #include "view_hook.h"
+#include "iss_mouse_aim.h"
 #include "gpu/tlggpu.h"
 #if !defined(__x86_64__) || !defined(__GNUC__)
 #error This prototype requires x86-64 GCC or Clang (including MinGW).
@@ -662,6 +663,7 @@ static void install_orb_multiplier(const char *app0, Segment *segments, uint64_t
     tlg_orbs_status(1);
     printf("Red orbs: live multiplier ready (3 validated gain paths, 0.1x to 100x)\n");
 }
+
 /* Writes a jump from image+at to `stub`; the rest of the replaced bytes become nops (the stub
  * replays them). 0 when the stub is out of relative-jump range. */
 static int install_jump(uint64_t at, unsigned length, unsigned char *stub) {
@@ -672,6 +674,99 @@ static int install_jump(uint64_t at, unsigned length, unsigned char *stub) {
     memcpy(image + at + 1, &relative, 4);
     memset(image + at + 5, 0x90, length - 5);
     return 1;
+}
+
+/* Direct mouse aim trampoline builder: redirects camera updating to runtime_mouse_aim_camera */
+static void install_iss_mouse_aim(const char *app0, Segment *segments, uint64_t count, uint64_t size) {
+    const char *enabled = getenv("ISS_DIRECT_MOUSE_AIM");
+    if (enabled && !strcmp(enabled, "0")) return;
+
+    char path[4096], serial[32] = "", version[32] = "";
+    snprintf(path, sizeof(path), "%s/sce_sys/param.sfo", app0 ? app0 : ".");
+    sfo_value(path, "TITLE_ID", serial, sizeof(serial), NULL);
+    sfo_value(path, "APP_VER", version, sizeof(version), NULL);
+
+    int executable = 0, writable = 0;
+    for (uint64_t i = 0; i < count; i++) {
+        if ((segments[i].flags & 1) && segments[i].address <= 0x14936eu &&
+            ISS_MOUSE_SITE + ISS_MOUSE_STOLEN <= segments[i].address + segments[i].size) executable = 1;
+        if ((segments[i].flags & 2) && segments[i].address <= 0xe16c40u &&
+            0xe16c40u < segments[i].address + segments[i].size) writable = 1;
+    }
+
+    const int valid_title = !strcmp(serial, "CUSA00223") || !strcmp(serial, "CUSA00004");
+    if (!valid_title || strcmp(version, "01.07") || !executable || !writable ||
+        !iss_mouse_signature(image, size)) {
+        puts("Direct mouse: incompatible title/code/mapping; mouse-to-stick fallback retained");
+        return;
+    }
+
+    unsigned char *bridge = allocate(page_size);
+    unsigned char *p = bridge;
+
+    /* Prologue: preserve registers and align stack */
+    unsigned char prologue[] = {
+        0x50, 0x51, 0x52, 0x56, 0x57, 0x41, 0x50, 0x41, 0x51, 0x41, 0x52, 0x41, 0x53,
+        0x48, 0x81, 0xec, 0x60, 0x00, 0x00, 0x00,
+        0x0f, 0x29, 0x04, 0x24,
+        0x0f, 0x29, 0x4c, 0x24, 0x10,
+        0x0f, 0x29, 0x54, 0x24, 0x20,
+        0x0f, 0x29, 0x5c, 0x24, 0x30
+    };
+    memcpy(p, prologue, sizeof(prologue)); p += sizeof(prologue);
+
+    /* Setup arguments for runtime_mouse_aim_camera:
+       rcx (MSABI) / rdi (SysV) = rbp + 0x330 (camera angles)
+       rdx (MSABI) / rsi (SysV) = rsp + 0x2f0 (camera data)
+       r8  (MSABI) / rdx (SysV) = rsp + 0x158 (camera context) */
+#ifdef _WIN32
+    *p++ = 0x48; *p++ = 0x8d; *p++ = 0x8d; *p++ = 0x30; *p++ = 0x03; *p++ = 0x00; *p++ = 0x00;
+    *p++ = 0x48; *p++ = 0x8d; *p++ = 0x94; *p++ = 0x24; *p++ = 0xf0; *p++ = 0x02; *p++ = 0x00; *p++ = 0x00;
+    *p++ = 0x4c; *p++ = 0x8d; *p++ = 0x84; *p++ = 0x24; *p++ = 0x58; *p++ = 0x01; *p++ = 0x00; *p++ = 0x00;
+#else
+    *p++ = 0x48; *p++ = 0x8d; *p++ = 0xbd; *p++ = 0x30; *p++ = 0x03; *p++ = 0x00; *p++ = 0x00;
+    *p++ = 0x48; *p++ = 0x8d; *p++ = 0xb4; *p++ = 0x24; *p++ = 0xf0; *p++ = 0x02; *p++ = 0x00; *p++ = 0x00;
+    *p++ = 0x48; *p++ = 0x8d; *p++ = 0x94; *p++ = 0x24; *p++ = 0x58; *p++ = 0x01; *p++ = 0x00; *p++ = 0x00;
+#endif
+
+    /* Call runtime_mouse_aim_camera */
+    uintptr_t target = (uintptr_t)runtime_mouse_aim_camera;
+    *p++ = 0x48; *p++ = 0xb8;
+    memcpy(p, &target, 8); p += 8;
+    *p++ = 0xff; *p++ = 0xd0;
+
+    /* Epilogue: restore SIMD and general registers */
+    unsigned char epilogue[] = {
+        0x0f, 0x28, 0x04, 0x24,
+        0x0f, 0x28, 0x4c, 0x24, 0x10,
+        0x0f, 0x28, 0x54, 0x24, 0x20,
+        0x0f, 0x28, 0x5c, 0x24, 0x30,
+        0x48, 0x81, 0xc4, 0x60, 0x00, 0x00, 0x00,
+        0x41, 0x5b, 0x41, 0x5a, 0x41, 0x59, 0x41, 0x58, 0x5f, 0x5e, 0x5a, 0x59, 0x58
+    };
+    memcpy(p, epilogue, sizeof(epilogue)); p += sizeof(epilogue);
+
+    /* Replay stolen 18 bytes from 0x14ebce */
+    unsigned char stolen[] = {
+        0xc5, 0xf8, 0x11, 0x84, 0x24, 0x00, 0x01, 0x00, 0x00,
+        0xc4, 0xc1, 0x78, 0x11, 0x85, 0x30, 0x03, 0x00, 0x00
+    };
+    memcpy(p, stolen, sizeof(stolen)); p += sizeof(stolen);
+
+    /* Jump back to guest code */
+    uintptr_t resume = (uintptr_t)(image + ISS_MOUSE_SITE + ISS_MOUSE_STOLEN);
+    *p++ = 0xff; *p++ = 0x25;
+    memset(p, 0, 4); p += 4;
+    memcpy(p, &resume, 8); p += 8;
+
+    protect(bridge, page_size, 5);
+
+    if (!install_jump(ISS_MOUSE_SITE, ISS_MOUSE_STOLEN, bridge)) {
+        puts("Direct mouse: hook outside jump range");
+        return;
+    }
+    runtime_mouse_aim_attach((uintptr_t)image);
+    puts("Direct mouse: guarded US/EU 1.07 angle input enabled; Controls sensitivity/invert apply; controller unchanged");
 }
 
 /* Damage dealt/taken and green/blue/gold orb multipliers (src/damage_hook.h, src/orb_hook.h):
@@ -1180,8 +1275,6 @@ int main(int argc, char **argv) {
     }
     isa_table = (isa_sets || red_zone_on) && isa_file ? isa_table_load(isa_file) : NULL;
     if (!isa_table && cpu_missing_sets) { printf("STOP: this CPU lacks %s and no rewrite table matches the image\n", missing); return 20; }
-    /* The stubs follow the image in the same low mapping (rel32 jmps reach them): the emulation
-     * stubs, then the red-zone stub code at the offset scripts/red_zone.py encoded it for. */
     size_t stub_area = isa_table ? round_page(isa_stub_area_size(isa_table)) : 0;
     size_t red_zone_area = 0;
     if (red_zone_on) {
@@ -1214,9 +1307,9 @@ int main(int argc, char **argv) {
         sfo_value(sfo,"TITLE_ID",serial,sizeof(serial),NULL);
         sfo_value(sfo,"ATTRIBUTE",NULL,0,&attributes);
         uint64_t sdk=0;
-        if (procparam) memcpy(&sdk,image+procparam+16,8); /* procparam: size, magic, count, sdk_version */
+        if (procparam) memcpy(&sdk,image+procparam+16,8);
         TlgGpuConfig gpu={title,serial,user_dir ? user_dir : "user",(uint32_t)sdk,attributes,1920,1080};
-        gpu_enabled=1; /* page tracking starts while the rasterizer registers guest memory */
+        gpu_enabled=1;
         boot_step("initializing GPU");
         if (tlggpu_init(&gpu)) fail("GPU initialization failed");
         boot_step("GPU ready");
@@ -1227,10 +1320,9 @@ int main(int argc, char **argv) {
     protect(data_traps, (import_count + 1) * page_size, 0);
     for (uint64_t i = 0; i < import_count; ++i) {
         unsigned char *t = traps + i * 32;
-        /* SysV: mov edi, index; movabs rax, handler; jmp rax. No fake return values. */
         uint32_t index = (uint32_t)i;
         uintptr_t handler = (uintptr_t)unresolved;
-        t[0] = 0x48; t[1] = 0x89; t[2] = 0xfe; /* mov rsi,rdi: preserve arg0 */
+        t[0] = 0x48; t[1] = 0x89; t[2] = 0xfe;
         t[3] = 0xbf; memcpy(t + 4, &index, 4);
         t[8] = 0x48; t[9] = 0xb8; memcpy(t + 10, &handler, 8);
         t[18] = 0xff; t[19] = 0xe0;
@@ -1261,8 +1353,6 @@ int main(int argc, char **argv) {
         memcpy(image + relocs[i].target, &value, 8);
     }
     if (check_imports) {
-        /* Lists every import the game would stop at, without running it (needs the GPU
-         * library: without --cpu-only its symbols are registered above). */
         unsigned char *checked=calloc(import_count ? import_count : 1,1);
         if (!checked) fail("allocation failed");
         uint64_t missing=0;
@@ -1276,7 +1366,7 @@ int main(int argc, char **argv) {
         }
         printf("Imports: %" PRIu64 " missing\n",missing);
         fflush(NULL);
-        _exit(missing ? 1 : 0); /* no destructors: GPU threads are running */
+        _exit(missing ? 1 : 0);
     }
     if (patch_file) apply_patches(patch_file, segments, ns, relocs, nr);
     if (gpu_enabled) install_orb_multiplier(app0, segments, ns, size);
@@ -1284,6 +1374,7 @@ int main(int argc, char **argv) {
     if (gpu_enabled) install_actor_watch(app0, segments, ns, size);
     if (gpu_enabled) install_stat_multipliers(app0, segments, ns, size);
     if (gpu_enabled) install_view_tuning(segments, ns, size);
+    if (gpu_enabled) install_iss_mouse_aim(app0, segments, ns, size);
 #ifdef _WIN32
     printf("Guest TCB loads redirected to the TEB TLS slot: %" PRIu64 "\n", patch_tcb_loads(segments, ns));
 #endif
@@ -1293,14 +1384,14 @@ int main(int argc, char **argv) {
         if (r.unsupported_needed) {
             printf("STOP: this CPU lacks %s and %u sites use encodings the rewrite cannot emulate\n", missing, r.unsupported_needed);
             fflush(NULL);
-            _exit(20); /* no destructors: GPU threads are running */
+            _exit(20);
         }
         if (forced) printf("ISA: forced rewrite of %u sites (TLG_ISA_REWRITE=%s; %u jmp, %u relocated, %u int3), %u skipped\n",
                            r.rewritten, policy, r.jmp, r.relocated, r.int3, r.skipped);
         else if (isa_sets) printf("ISA: CPU lacks %s: %u sites rewritten (%u jmp, %u relocated, %u int3), %u skipped\n",
                                   missing, r.rewritten, r.jmp, r.relocated, r.int3, r.skipped);
         if (red_zone_on) {
-            const uint32_t *st = isa_table->rz_stats;   /* scripts/red_zone.py STATS_FIELDS */
+            const uint32_t *st = isa_table->rz_stats;
             IsaRedZoneReport z = isa_red_zone_apply(isa_table, image, stubs + stub_area);
             printf("Red zone: %u instructions protected in %u patches (%u short-jump relays), %u patches skipped; "
                    "%u red-zone functions of %u (%u conservative); not protected: %u use rsp, %u control flow, "
@@ -1336,7 +1427,6 @@ int main(int argc, char **argv) {
         runtime_set_main_tls(image+main_tls[0],main_tls[1],main_tls[2],main_tls[3]);
         runtime_thread_attach_main();
         runtime_set_procparam(image+procparam);
-        /* Dependencies start in link order (libc first), as the PS4 dynamic linker does. */
         for (uint64_t m=0;m<module_count;++m) {
             printf("Starting linked module %" PRIu64 " at image offset 0x%" PRIx64 "; native bindings=%" PRIu64 "\n",m,modules[m].init,nb);
             typedef int (ABI *ModuleInit)(uint64_t,void *,void *);
@@ -1345,8 +1435,7 @@ int main(int argc, char **argv) {
             if (result) fail("module initializer failed");
         }
     }
-    {   /* TLG_FREEZE_REPORT_SECONDS (default 10, 0 = off): no new frame for that long writes
-         * every thread's wait, RIP and frames to the log (runtime_freeze.c). Needs the GPU. */
+    {
         const char *freeze = getenv("TLG_FREEZE_REPORT_SECONDS");
         unsigned seconds = freeze && *freeze ? (unsigned)strtoul(freeze, NULL, 10) : 10;
         runtime_freeze_start((uintptr_t)image, round_page(size) + stub_area + red_zone_area, gpu_enabled ? seconds : 0);
@@ -1355,9 +1444,6 @@ int main(int argc, char **argv) {
     boot_step("entering the game");
     printf("Entering original x86-64 code at guest offset 0x%" PRIx64 "\n", entry);
 #ifdef _WIN32
-    /* The guest main thread starts with the PS4's (FreeBSD's) x87 control word: 64-bit
-     * precision (0x037F, as on Linux). Windows' default is 53-bit (0x027F). Threads the game
-     * creates copy the creator's x87 and SSE control words (runtime_thread.c host_start). */
     { const uint16_t cw = 0x037F; __asm__ volatile("fldcw %0" : : "m"(cw)); }
 #endif
     entered_game=1;
@@ -1366,7 +1452,6 @@ int main(int argc, char **argv) {
     typedef void (ABI *Entry)(void *, void (ABI *)(void));
     ((Entry)(image + entry))(&params, guest_exit);
 #else
-    /* The guest main thread runs on a stack below 1 TiB like PS4 stacks. */
     enum { MAIN_STACK=8*1024*1024 };
     unsigned char *stack=runtime_low_map(MAIN_STACK,PROT_READ|PROT_WRITE);
     if (!stack) fail("cannot allocate guest main stack");
