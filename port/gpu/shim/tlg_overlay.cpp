@@ -1962,9 +1962,12 @@ bool HandleEvent(const SDL_Event& event) {
             settings.show_fps = !settings.show_fps;
             return true;
         }
-        if (down && !event.key.repeat &&
-            (event.key.key == SDLK_INSERT || (is_open && event.key.key == SDLK_ESCAPE))) {
-            SetOpen(event.key.key == SDLK_INSERT ? !is_open : false);
+        const bool is_toggle = (event.key.key == SDLK_INSERT || 
+                                event.key.key == SDLK_KP_0 || 
+                                event.key.key == SDLK_GRAVE);
+
+        if (down && !event.key.repeat && (is_toggle || (is_open && event.key.key == SDLK_ESCAPE))) {
+            SetOpen(is_toggle ? !is_open : false);
             return true;
         }
         if (!is_open) {
