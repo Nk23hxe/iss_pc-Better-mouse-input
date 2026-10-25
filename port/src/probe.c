@@ -905,7 +905,7 @@ static void install_iss_camera_speed(const char *app0, Segment *segments, uint64
 
 static void install_iss_mouse_aim(const char *app0,Segment *segments,uint64_t count,uint64_t size){
     const char *enabled=getenv("ISS_DIRECT_MOUSE_AIM");
-    if(!enabled || strcmp(enabled,"1"))return;
+    if(enabled && !strcmp(enabled,"0"))return;
     char path[4096],serial[32]="",version[32]="";
     snprintf(path,sizeof(path),"%s/sce_sys/param.sfo",app0 ? app0 : ".");
     sfo_value(path,"TITLE_ID",serial,sizeof(serial),NULL);sfo_value(path,"APP_VER",version,sizeof(version),NULL);
@@ -1352,7 +1352,7 @@ int main(int argc, char **argv) {
                                    x->tls_filesz>x->tls_memsz || x->tls_module<2 || x->tls_module>7)))
                 fail("invalid linked module metadata");
         }
-        if (nb>import_count) fail("invalid binding count");
+        if (!nb>import_count) fail("invalid binding count");
         for (uint64_t i=0;i<nb;++i) {
             uint64_t index=read64(f),address=read64(f),kind=read64(f);
             int inside=0;
