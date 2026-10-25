@@ -22,6 +22,7 @@
 #include <SDL3/SDL.h>
 #include "mouse_stick.h"
 #include "mouse_touch.h"
+#include "iss_mouse_aim.h"
 #include <sys/stat.h>
 
 #define ERR_INVALID_ARG ((int32_t)0x80920001)
@@ -512,6 +513,7 @@ static uint32_t sample_mouse(PadData *d, bool aiming_can, const bool *k) {
         mouse_pad.active=mouse_pad.two_fingers=false;
         mouse_touch_lift(&mouse_pad.finger);
         tlggpu_mouse_pad_hud(0,0,0,0,0);
+        runtime_mouse_aim_motion(0.0f,0.0f,in.sensitivity,in.invert_y,0);
         return 0;
     }
     load_pad_mode();
@@ -562,22 +564,37 @@ static uint32_t sample_mouse(PadData *d, bool aiming_can, const bool *k) {
     } else {
         tlggpu_mouse_pad_hud(0,0,0,0,0);
     }
+    
+    int direct_aim_handled = 0;
     if (pad_mode) {
+        runtime_mouse_aim_motion(0.0f,0.0f,in.sensitivity,in.invert_y,0);
     } else if (aiming_can) {
-        const float k=0.0006f*in.sensitivity*tlggpu_sensor_aim_scale();
-        motion.yaw-=m.dx*k;
-        motion.aim_pitch+=(in.invert_y ? m.dy : -m.dy)*k;
+        const float kc=0.0006f*in.sensitivity*tlggpu_sensor_aim_scale();
+        motion.yaw-=m.dx*kc;
+        motion.aim_pitch+=(in.invert_y ? m.dy : -m.dy)*kc;
         motion.yaw=fminf(fmaxf(motion.yaw,-1.4f),1.4f);
         motion.aim_pitch=fminf(fmaxf(motion.aim_pitch,-1.2f),1.2f);
         memset(&mouse_stick,0,sizeof(mouse_stick));
-    } else mouse_stick_update(&mouse_stick,&p,m.dx,m.dy,dt);
+        runtime_mouse_aim_motion(0.0f,0.0f,in.sensitivity,in.invert_y,0);
+    } else {
+        /* Direct camera angle injection hook (Axylpup 1:1 camera aim) */
+        direct_aim_handled = runtime_mouse_aim_motion(m.dx, m.dy, in.sensitivity, in.invert_y, m.captured);
+        if (direct_aim_handled) {
+            memset(&mouse_stick,0,sizeof(mouse_stick));
+        } else {
+            /* Fallback to stick emulation if hook not applicable */
+            mouse_stick_update(&mouse_stick,&p,m.dx,m.dy,dt);
+        }
+    }
 
     const uint8_t base_x=d->right_x, base_y=d->right_y;
-    const float def_x=mouse_stick_axis(&mouse_stick,&p,0);
-    const float def_y=mouse_stick_axis(&mouse_stick,&p,1);
-    if (def_x!=0.0f || def_y!=0.0f) {
-        d->right_x=mouse_stick_add(128,def_x);
-        d->right_y=mouse_stick_add(128,def_y);
+    if (!direct_aim_handled) {
+        const float def_x=mouse_stick_axis(&mouse_stick,&p,0);
+        const float def_y=mouse_stick_axis(&mouse_stick,&p,1);
+        if (def_x!=0.0f || def_y!=0.0f) {
+            d->right_x=mouse_stick_add(128,def_x);
+            d->right_y=mouse_stick_add(128,def_y);
+        }
     }
     uint32_t bits=raw;
     if (pad_mode) bits&=~(uint32_t)MOUSE_BUTTONS_MASK;
@@ -596,10 +613,10 @@ static uint32_t sample_mouse(PadData *d, bool aiming_can, const bool *k) {
     if (log_state<0) { const char *a=getenv("TLG_MOUSE_LOG"), *b=getenv("TLG_MOUSE_TEST"); log_state=(a && *a=='1') || (b && *b=='1'); }
     if (log_state) {
         static bool was_active;
-        const bool active=bits || d->right_x!=base_x || d->right_y!=base_y || pad_mode;
+        const bool active=bits || d->right_x!=base_x || d->right_y!=base_y || pad_mode || direct_aim_handled;
         if ((active && now-last_log>=250000) || (was_active && !active)) {
-            printf("Runtime: mouse dx=%.1f dy=%.1f -> right stick %u,%u, mouse buttons 0x%x%s\n",m.dx,m.dy,
-                   d->right_x,d->right_y,bits,pad_mode ? " (touchpad mode)" : "");
+            printf("Runtime: mouse dx=%.1f dy=%.1f direct_aim=%d -> right stick %u,%u, mouse buttons 0x%x%s\n",m.dx,m.dy,
+                   direct_aim_handled,d->right_x,d->right_y,bits,pad_mode ? " (touchpad mode)" : "");
             if (pad_mode)
                 printf("Runtime: mouse finger at %.0f,%.0f touch=%d click=%d two=%d\n",mouse_pad.out.x,mouse_pad.out.y,
                        mouse_pad.out.touch,mouse_pad.out.click,mouse_pad.two_fingers);
