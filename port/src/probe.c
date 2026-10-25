@@ -1352,8 +1352,7 @@ int main(int argc, char **argv) {
                                    x->tls_filesz>x->tls_memsz || x->tls_module<2 || x->tls_module>7)))
                 fail("invalid linked module metadata");
         }
-        if (!nb>import_count) fail("invalid binding count");
-        for (uint64_t i=0;i<nb;++i) {
+if (nb>import_count) fail("invalid binding count");        for (uint64_t i=0;i<nb;++i) {
             uint64_t index=read64(f),address=read64(f),kind=read64(f);
             int inside=0;
             for (uint64_t m=0;m<module_count;++m)
